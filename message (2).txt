@@ -1,0 +1,875 @@
+-- ====================================================================================
+-- KEYBIND INSTRUCTIONS & CONSOLE LOGS:
+-- Press 'L'  -> Leaves the arcade match instantly
+-- Press 'G'  -> Joins the arcade lobby instantly
+-- Press 'W'  -> Toggles the Whitelist script on or off (Runs an instant scan if enabled)
+-- Press 'R'  -> Re-scans and forces map to be invisible (Players stay visible)
+-- Press 'T'  -> Toggles Target Stats Protection (Auto-leave) ON or OFF
+-- Press 'Y'  -> Instantly rejoins the current server job ID
+-- Press 'F2' -> Self-destructs the Rivals leaderboard UI and script references
+-- Press 'F4' -> Toggles the Rivals leaderboard visibility on or off
+-- ====================================================================================
+
+local fenv = getfenv()
+local TARGET_NAME = "user u tp to"          
+local AutoRespawnEnabled = true     
+local TELEPORT_ENABLED = true       
+local NOCLIP_ENABLED = true         
+local START_TRACKING_AT = "0.0"
+
+getgenv().WhitelistConfig = {
+    Enabled = false,                 
+    WHITELIST = {
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username",
+        "username"
+    }
+}
+
+local autoHealth = true
+local autoAmmo = true
+
+local SETTINGS = {
+    PROTECTION_ENABLED = true, -- Controlled by the 'T' keybind
+    TARGET_LEVEL = 990,
+    TARGET_WINSTREAK = 1000,
+    TARGET_RANK_ELO = 3600,
+    CHECK_INTERVAL = 3,
+}
+
+local RANK_ORDER = {
+    ["Unranked"] = 0, ["Bronze"] = 1, ["Silver"] = 2, ["Gold"] = 3,
+    ["Platinum"] = 4, ["Diamond"] = 5, ["Onyx"] = 6, ["Nemesis"] = 7, ["Unknown"] = 8
+}
+
+local RANK_COLORS = {
+    ["Unranked"] = Color3.fromRGB(128, 128, 128),
+    ["Bronze"] = Color3.fromRGB(205, 127, 50),
+    ["Silver"] = Color3.fromRGB(192, 192, 192),
+    ["Gold"] = Color3.fromRGB(255, 215, 0),
+    ["Platinum"] = Color3.fromRGB(0, 191, 255),
+    ["Diamond"] = Color3.fromRGB(0, 255, 255),
+    ["Onyx"] = Color3.fromRGB(128, 0, 128),
+    ["Nemesis"] = Color3.fromRGB(255, 0, 0),
+    ["Unknown"] = Color3.fromRGB(255, 255, 255)
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local VirtualInput = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+repeat task.wait() until game:IsLoaded() and LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
+
+local targetPlayer = nil
+local HEIGHT_OFFSET = -2
+local ELEVATE_SPAWN = 4
+local handlingDeathRoutine = false 
+local leaderboardVisible = true
+local selfDestructed = false
+local statusDot = nil
+
+local function rejoin()
+    local success, errorMessage = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end)
+
+    if not success then
+        warn("Rejoin failed: " .. tostring(errorMessage))
+    end
+end
+
+local function GetRankName(elo)
+    local eloNum = tonumber(elo) or 0
+    if eloNum <= 1 then return "Unranked"
+    elseif eloNum < 600 then return "Bronze"
+    elseif eloNum >= 600 and eloNum < 1200 then return "Silver"
+    elseif eloNum >= 1200 and eloNum < 1800 then return "Gold"
+    elseif eloNum >= 1800 and eloNum < 2400 then return "Platinum"
+    elseif eloNum >= 2400 and eloNum < 3000 then return "Diamond"
+    elseif eloNum >= 3000 and eloNum < 3600 then return "Onyx"
+    elseif eloNum >= 3600 and eloNum < 3800 then return "Nemesis"
+    else return "Unknown" end
+end
+
+local function GetRankColor(elo)
+    local rank = GetRankName(elo)
+    return RANK_COLORS[rank] or Color3.fromRGB(255, 255, 255)
+end
+
+local function GetPlayerStats(plr)
+    if not plr then return nil end
+    local stats = { Player = plr, Name = plr.Name or "Unknown", Level = "?", Elo = "?", Winstreak = "?" }
+    local function ScanForStats(obj)
+        if not obj then return end
+        for _, child in ipairs(obj:GetChildren() or {}) do
+            if child and (child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("StringValue")) then
+                local name = (child.Name or ""):lower()
+                local val = tostring(child.Value or "")
+                if name:find("level") then stats.Level = val
+                elseif name:find("elo") or name:find("rank") or name:find("rating") then stats.Elo = val
+                elseif name:find("win") and name:find("streak") then stats.Winstreak = val end
+            end
+            if child and child:IsA("Folder") then ScanForStats(child) end
+        end
+    end
+    ScanForStats(plr)
+    return stats
+end
+
+local function forceDisconnect()
+    pcall(function()
+        for _, event in pairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+            if event:IsA("RemoteEvent") or event:IsA("RemoteFunction") then event:Destroy() end
+        end
+    end)
+    pcall(function()
+        for _, player in pairs(Players:GetPlayers()) do
+            if player.Character then
+                for _, part in pairs(player.Character:GetDescendants()) do
+                    if part:IsA("BasePart") then part:SetNetworkOwner(nil) end
+                end
+            end
+        end
+    end)
+    pcall(function() LocalPlayer:SetSuperSimulated(true) end)
+    pcall(function() game:Shutdown() end)
+    pcall(function()
+        RunService.Heartbeat:Disconnect()
+        RunService.RenderStepped:Disconnect()
+    end)
+end
+
+local function CheckForHighStats(playerData)
+    if not SETTINGS.PROTECTION_ENABLED then return false end
+
+    local levelEnabled = SETTINGS.TARGET_LEVEL > 0
+    local streakEnabled = SETTINGS.TARGET_WINSTREAK > 0
+    local rankEnabled = SETTINGS.TARGET_RANK_ELO > 0
+    if not levelEnabled and not streakEnabled and not rankEnabled then return false end
+
+    local shouldLeave = false
+    local leaveReason = ""
+    for _, data in ipairs(playerData) do
+        if data then
+            local levelNum = tonumber(data.Level) or 0
+            local streakNum = tonumber(data.Winstreak) or 0
+            local eloNum = tonumber(data.Elo) or 0
+            local rankName = GetRankName(eloNum)
+            if levelEnabled and levelNum >= SETTINGS.TARGET_LEVEL then
+                shouldLeave = true
+                leaveReason = string.format("%s has %s levels (target: %s+)", data.Name, levelNum, SETTINGS.TARGET_LEVEL)
+                break
+            end
+            if streakEnabled and streakNum >= SETTINGS.TARGET_WINSTREAK then
+                shouldLeave = true
+                leaveReason = string.format("%s has %s winstreak (target: %s+)", data.Name, streakNum, SETTINGS.TARGET_WINSTREAK)
+                break
+            end
+            if rankEnabled and eloNum >= SETTINGS.TARGET_RANK_ELO then
+                shouldLeave = true
+                leaveReason = string.format("%s has %s ELO (%s) (target: %s+ ELO)", data.Name, eloNum, rankName, SETTINGS.TARGET_RANK_ELO)
+                break
+            end
+        end
+    end
+    if shouldLeave then
+        print("\nhigh stat detected. leaving..\nreason: " .. leaveReason .. "\n")
+        task.wait(1)
+        forceDisconnect()
+        return true
+    end
+    return false
+end
+
+local function UpdateStatusDot()
+    if not statusDot or selfDestructed then return end
+    if not SETTINGS.PROTECTION_ENABLED then
+        statusDot.BackgroundColor3 = Color3.fromRGB(255, 50, 50) -- Red when turned off
+    else
+        statusDot.BackgroundColor3 = Color3.fromRGB(0, 255, 100) -- Green when active
+    end
+end
+
+local function instantTeleportTo(targetPos, CustomOffset)
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local localHRP = LocalPlayer.Character.HumanoidRootPart
+        local offset = CustomOffset or HEIGHT_OFFSET
+        localHRP.CFrame = CFrame.new(targetPos + Vector3.new(0, offset, 0))
+    end
+end
+
+local function safeTeleportTo(targetPos, CustomOffset)
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local localHRP = LocalPlayer.Character.HumanoidRootPart
+        local offset = CustomOffset or HEIGHT_OFFSET
+        local targetCFrame = CFrame.new(targetPos + Vector3.new(0, offset, 0))
+        local tween = TweenService:Create(localHRP, TweenInfo.new(0.005, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+        tween:Play()
+    end
+end
+
+local function toggleNoClip()
+    if NOCLIP_ENABLED and LocalPlayer.Character then
+        for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+        end
+    end
+end
+
+local function findTarget()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Name:lower() == TARGET_NAME:lower() then
+            targetPlayer = player
+            return true
+        end
+    end
+    return false
+end
+
+local function fireMacroClickFast()
+    local screenSize = Camera.ViewportSize
+    local centerX = screenSize.X / 2
+    local centerY = (screenSize.Y / 2) + 36
+    task.spawn(function()
+        VirtualInput:SendMouseButtonEvent(centerX, centerY, 0, true, game, 1)
+        VirtualInput:SendMouseButtonEvent(centerX, centerY, 0, false, game, 1)
+        VirtualInput:SendMouseButtonEvent(centerX, centerY, 0, true, game, 1)
+        VirtualInput:SendMouseButtonEvent(centerX, centerY, 0, false, game, 1)
+    end)
+end
+
+RunService.Heartbeat:Connect(function()
+    if NOCLIP_ENABLED then toggleNoClip() end
+    if not handlingDeathRoutine and TELEPORT_ENABLED and targetPlayer and targetPlayer.Parent then
+        local targetChar = targetPlayer.Character
+        if targetChar and targetChar:FindFirstChild("HumanoidRootPart") then
+            instantTeleportTo(targetChar.HumanoidRootPart.Position)
+        end
+    elseif not handlingDeathRoutine then
+        findTarget()
+    end
+end)
+
+local function setupDeathConnection(character)
+    local humanoid = character:WaitForChild("Humanoid", 5)
+    if humanoid then
+        humanoid.Died:Connect(function()
+            if AutoRespawnEnabled and not handlingDeathRoutine then
+                handlingDeathRoutine = true
+                task.spawn(function()
+                    while handlingDeathRoutine and character and character.Parent do
+                        VirtualInput:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                        task.wait(0.05)
+                        VirtualInput:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                        task.wait(0.05)
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    setupDeathConnection(newCharacter)
+    if not handlingDeathRoutine then return end
+    local hrp = newCharacter:WaitForChild("HumanoidRootPart", 5)
+    if hrp then
+        safeTeleportTo(hrp.Position, ELEVATE_SPAWN)
+        toggleNoClip()
+        task.wait(1.0) 
+        fireMacroClickFast()
+    end
+    handlingDeathRoutine = false
+end)
+
+if LocalPlayer.Character then setupDeathConnection(LocalPlayer.Character) end
+Players.PlayerAdded:Connect(function(player)
+    if player.Name:lower() == TARGET_NAME:lower() then targetPlayer = player end
+end)
+findTarget()
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "SinTP"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0, 190, 0, 25)
+statusLabel.Position = UDim2.new(0, 10, 0, 10)
+statusLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+statusLabel.BackgroundTransparency = 0.2
+statusLabel.BorderSizePixel = 0
+statusLabel.TextColor3 = Color3.new(0, 1, 0)
+statusLabel.TextScaled = true
+statusLabel.Font = Enum.Font.SourceSansBold
+statusLabel.Text = "sin tp: max speed engine"
+statusLabel.Parent = screenGui
+
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        if handlingDeathRoutine then
+            statusLabel.Text = "ssirangel tech v6"
+            statusLabel.TextColor3 = Color3.new(1, 0.5, 0)
+        elseif targetPlayer and targetPlayer.Parent then
+            statusLabel.Text = "Sin TP: -1 DOWN + NoClip + sirangel✓"
+            statusLabel.TextColor3 = Color3.new(0, 1, 0)
+        else
+            statusLabel.Text = "Sin TP: SEARCHING"
+            statusLabel.TextColor3 = Color3.new(1, 1, 0)
+        end
+    end
+end)
+
+local function makePartTransparent(part)
+    if part:IsA("BasePart") and part.Transparency ~= 1 then
+        part.Transparency = 1
+        part.Material = Enum.Material.SmoothPlastic
+        for _, child in ipairs(part:GetChildren()) do
+            if child:IsA("Decal") or child:IsA("Texture") then child:Destroy() end
+        end
+        return true
+    end
+    return false
+end
+
+local function isPlayerPart(part)
+    local model = part:IsA("Model") and part or part:FindFirstAncestorOfClass("Model")
+    if model and model:FindFirstChild("Humanoid") then
+        for _, player in ipairs(game:GetService("Players"):GetPlayers()) do
+            if player.Character == model then return true end
+        end
+    end
+    return false
+end
+
+local function hideMapKeepPlayers()
+    local allParts = game:GetService("Workspace"):GetDescendants()
+    local mapCount, playerCount = 0, 0
+    for _, part in ipairs(allParts) do
+        if part:IsA("BasePart") then
+            if isPlayerPart(part) then
+                if part.Transparency ~= 0 then part.Transparency = 0 playerCount = playerCount + 1 end
+            else
+                if part.Transparency ~= 1 then makePartTransparent(part) mapCount = mapCount + 1 end
+            end
+        end
+    end
+    print("Hidden " .. mapCount .. " map parts - Kept " .. playerCount .. " player parts visible")
+end
+
+hideMapKeepPlayers()
+task.spawn(function()
+    while true do task.wait(60) hideMapKeepPlayers() end
+end)
+
+local VIM = game:GetService("VirtualInputManager")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local list = {
+    "station", "docks", "big arena", "iceberg", "bigbackrooms", "bigsplash", "museum", 
+    "westown", "bigstation", "bigcrossroads", "biggraveyard", "shootingrange", "skip", "leave"
+}
+local trackedButtons = {}
+local activeSpamTarget = nil
+
+local function isTrulyVisible(v)
+    if not (v and v:IsDescendantOf(game) and v.Visible and v.TextTransparency < 1) then return false end
+    local p, s = v.AbsolutePosition, v.AbsoluteSize
+    local screenSize = Camera.ViewportSize
+    if s.X <= 10 or s.Y <= 10 then return false end
+    if p.X < 0 or p.Y < 0 or p.X + s.X > screenSize.X or p.Y + s.Y > screenSize.Y then return false end
+    local parent = v.Parent
+    while parent and parent:IsA("GuiObject") do
+        if not parent.Visible then return false end
+        parent = parent.Parent
+    end
+    return true
+end
+
+local function spamClickElement(v)
+    while isTrulyVisible(v) and activeSpamTarget == v do
+        local p, s = v.AbsolutePosition, v.AbsoluteSize
+        local x, y = p.X + s.X/2, p.Y + s.Y/2 + 36
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        task.wait(0.05) 
+    end
+    if activeSpamTarget == v then activeSpamTarget = nil end
+end
+
+local function evaluateHighestPriority()
+    local highestTarget, highestIndex = nil, 99
+    for v, _ in pairs(trackedButtons) do
+        if isTrulyVisible(v) then
+            local txt = v.Text:lower():gsub("%s+", "")
+            for i, name in ipairs(list) do
+                if txt == name and i < highestIndex then highestIndex = i highestTarget = v end
+            end
+        end
+    end
+    if highestTarget and activeSpamTarget ~= highestTarget then
+        activeSpamTarget = highestTarget
+        task.spawn(spamClickElement, highestTarget)
+    end
+end
+
+local function bindTracking(v)
+    if v:IsA("TextLabel") or v:IsA("TextButton") then
+        local function updateCache()
+            local txt = v.Text:lower():gsub("%s+", "")
+            local isMatch = false
+            for _, name in ipairs(list) do
+                if txt == name then isMatch = true break end
+            end
+            if isMatch then trackedButtons[v] = true evaluateHighestPriority() else trackedButtons[v] = nil end
+        end
+        v:GetPropertyChangedSignal("Text"):Connect(updateCache)
+        v:GetPropertyChangedSignal("Visible"):Connect(evaluateHighestPriority)
+        v:GetPropertyChangedSignal("AbsolutePosition"):Connect(evaluateHighestPriority)
+        updateCache()
+    end
+end
+
+for _, desc in ipairs(PlayerGui:GetDescendants()) do bindTracking(desc) end
+PlayerGui.DescendantAdded:Connect(function(v) task.defer(bindTracking, v) end)
+
+local function triggerArcadeJoin()
+    local arcadeRemote = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 3):WaitForChild("Arcade", 3):WaitForChild("Join", 3)
+    if arcadeRemote then arcadeRemote:FireServer() end
+end
+task.spawn(triggerArcadeJoin)
+
+if game.CreatorId == 3461453 then
+    local function makeInvisible(object)
+        if object:IsA("BasePart") then object.Transparency = 1 object.CanCollide = false
+        elseif object:IsA("BillboardGui") or object:IsA("SurfaceGui") then object.Enabled = false end
+        for _, child in ipairs(object:GetChildren()) do makeInvisible(child) end
+    end
+    RunService.Heartbeat:Connect(function()
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj.Name == "_drop" and obj:IsA("BasePart") then
+                local isHealth = obj:FindFirstChild("Health")
+                local isAmmo = obj:FindFirstChild("Ammo")
+                if not isAmmo then
+                    for _, child in ipairs(obj:GetChildren()) do
+                        if string.find(string.lower(child.Name), "ammo") then isAmmo = true break end
+                    end
+                end
+                if (autoAmmo and isAmmo) or (autoHealth and isHealth) then makeInvisible(obj) end
+            end
+        end
+    end)
+else
+    LocalPlayer:Kick("doesnt work")
+    return
+end
+
+local function isWhitelisted(name)
+    for _, allowedName in ipairs(getgenv().WhitelistConfig.WHITELIST) do
+        if name == allowedName then return true end
+    end
+    return false
+end
+
+local function onPlayerAdded(player)
+    if not getgenv().WhitelistConfig.Enabled then return end
+    if player == LocalPlayer then return end
+    if not isWhitelisted(player.Name) then task.wait(1) forceDisconnect() end
+end
+
+task.spawn(function()
+    task.wait(20)
+    for _, player in ipairs(Players:GetPlayers()) do onPlayerAdded(player) end
+    Players.PlayerAdded:Connect(onPlayerAdded)
+end)
+
+local RivalsLeaderboard = Instance.new("ScreenGui")
+RivalsLeaderboard.Name = "RivalsLeaderboard"
+RivalsLeaderboard.ResetOnSpawn = false
+RivalsLeaderboard.IgnoreGuiInset = true
+RivalsLeaderboard.DisplayOrder = 999999
+RivalsLeaderboard.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+RivalsLeaderboard.Parent = LocalPlayer.PlayerGui
+
+local RivalsBoard = Instance.new("Frame")
+RivalsBoard.Name = "RivalsBoard"
+RivalsBoard.Size = UDim2.new(0, 420, 0, 380)
+RivalsBoard.Position = UDim2.new(1, -440, 0, 50)
+RivalsBoard.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+RivalsBoard.BackgroundTransparency = 0.08
+RivalsBoard.BorderSizePixel = 0
+RivalsBoard.Parent = RivalsLeaderboard
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 12)
+corner.Parent = RivalsBoard
+
+local stroke = Instance.new("UIStroke")
+stroke.Thickness = 1
+stroke.Color = Color3.fromRGB(60, 60, 80)
+stroke.Transparency = 0.5
+stroke.Parent = RivalsBoard
+
+local ResizeHandle = Instance.new("Frame")
+ResizeHandle.Name = "ResizeHandle"
+ResizeHandle.Size = UDim2.new(0, 16, 0, 16)
+ResizeHandle.Position = UDim2.new(1, -16, 1, -16)
+ResizeHandle.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+ResizeHandle.BackgroundTransparency = 0.5
+ResizeHandle.BorderSizePixel = 0
+ResizeHandle.ZIndex = 10
+ResizeHandle.Parent = RivalsBoard
+
+local handleCorner = Instance.new("UICorner")
+handleCorner.CornerRadius = UDim.new(0, 4)
+handleCorner.Parent = ResizeHandle
+
+for i = 0, 2 do
+    for j = 0, 2 do
+        if i + j >= 3 then
+            local dot = Instance.new("Frame")
+            dot.Size = UDim2.new(0, 2, 0, 2)
+            dot.Position = UDim2.new(0, 2 + (i * 4), 0, 2 + (j * 4))
+            dot.BackgroundColor3 = Color3.fromRGB(120, 120, 150)
+            dot.BorderSizePixel = 0
+            dot.Parent = ResizeHandle
+        end
+    end
+end
+
+local dragging, dragStart, startPos = false, nil, nil
+local resizing, resizeStart, startSize = false, nil, nil
+local minSize = UDim2.new(0, 300, 0, 200)
+local maxSize = UDim2.new(0, 800, 0, 600)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 38)
+titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+titleBar.BackgroundTransparency = 0.3
+titleBar.BorderSizePixel = 0
+titleBar.Parent = RivalsBoard
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 12)
+titleCorner.Parent = titleBar
+
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(0.5, 0, 1, 0)
+titleText.Position = UDim2.new(0, 14, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Font = Enum.Font.GothamBold
+titleText.TextSize = 15
+titleText.TextColor3 = Color3.fromRGB(220, 220, 235)
+titleText.Text = "RIVALS"
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Parent = titleBar
+
+local subtitleText = Instance.new("TextLabel")
+subtitleText.Size = UDim2.new(0.5, 0, 1, 0)
+subtitleText.Position = UDim2.new(0.5, 0, 0, 0)
+subtitleText.BackgroundTransparency = 1
+subtitleText.Font = Enum.Font.Gotham
+subtitleText.TextSize = 11
+subtitleText.TextColor3 = Color3.fromRGB(150, 150, 180)
+subtitleText.Text = "LEADERBOARD"
+subtitleText.TextXAlignment = Enum.TextXAlignment.Left
+subtitleText.Parent = titleBar
+
+statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.new(0, 8, 0, 8)
+statusDot.Position = UDim2.new(1, -22, 0.5, -4)
+statusDot.BorderSizePixel = 0
+statusDot.Parent = titleBar
+
+local statusDotCorner = Instance.new("UICorner")
+statusDotCorner.CornerRadius = UDim.new(1, 0)
+statusDotCorner.Parent = statusDot
+
+local ListFrame = Instance.new("ScrollingFrame")
+ListFrame.Name = "ListFrame"
+ListFrame.Size = UDim2.new(1, -16, 1, -50)
+ListFrame.Position = UDim2.new(0, 8, 0, 44)
+ListFrame.BackgroundTransparency = 1
+ListFrame.ScrollBarThickness = 4
+ListFrame.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 80)
+ListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+ListFrame.Parent = RivalsBoard
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 2)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = ListFrame
+
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true 
+        dragStart = input.Position 
+        startPos = RivalsBoard.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        RivalsBoard.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+    if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - resizeStart
+        local newWidth = math.clamp(startSize.X.Offset + delta.X, minSize.X.Offset, maxSize.X.Offset)
+        local newHeight = math.clamp(startSize.Y.Offset + delta.Y, minSize.Y.Offset, maxSize.Y.Offset)
+        RivalsBoard.Size = UDim2.new(0, newWidth, 0, newHeight)
+        ResizeHandle.Position = UDim2.new(1, -16, 1, -16)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then 
+        dragging = false 
+        resizing = false 
+    end
+end)
+
+ResizeHandle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        resizing = true 
+        resizeStart = input.Position 
+        startSize = RivalsBoard.Size
+    end
+end)
+
+local function PrintToConsole(playerData)
+    print("\n#    | Player                | Level   | Rank (ELO)      | Winstreak")
+    print("----------------------------------------------------------------------")
+    for i, data in ipairs(playerData) do
+        if data then
+            local rankName = GetRankName(tonumber(data.Elo) or 0)
+            local namePadded = string.sub((data.Name or "Unknown") .. string.rep(" ", 20), 1, 20)
+            local levelPadded = string.sub((data.Level or "?") .. string.rep(" ", 8), 1, 8)
+            local rankPadded = string.sub(rankName .. " (" .. (data.Elo or "?") .. ")" .. string.rep(" ", 15), 1, 15)
+            local streakPadded = string.sub((data.Winstreak or "?") .. string.rep(" ", 10), 1, 10)
+            print(string.format("%-4s | %s | %s | %s | %s", tostring(i), namePadded, levelPadded, rankPadded, streakPadded))
+        end
+    end
+    print("----------------------------------------------------------------------")
+    print("Total Players: " .. #playerData)
+    local lStat = SETTINGS.TARGET_LEVEL > 0 and tostring(SETTINGS.TARGET_LEVEL) or "OFF"
+    local sStat = SETTINGS.TARGET_WINSTREAK > 0 and tostring(SETTINGS.TARGET_WINSTREAK) or "OFF"
+    local rStat = SETTINGS.TARGET_RANK_ELO > 0 and tostring(SETTINGS.TARGET_RANK_ELO) or "OFF"
+    local protStatus = SETTINGS.PROTECTION_ENABLED and "ON" or "OFF"
+    print("Protection: " .. protStatus .. " (Level:" .. lStat .. " | Streak:" .. sStat .. " | Rank ELO:" .. rStat .. ")\n")
+end
+
+local function RefreshLeaderboard()
+    if selfDestructed then return end
+    for _, child in ipairs(ListFrame:GetChildren() or {}) do
+        if child and child:IsA("TextLabel") then child:Destroy() end
+    end
+    local playerData = {}
+    for _, plr in ipairs(Players:GetPlayers() or {}) do
+        local data = GetPlayerStats(plr)
+        if data then table.insert(playerData, data) end
+    end
+    table.sort(playerData, function(a, b)
+        return (tonumber(a.Elo) or 0) > (tonumber(b.Elo) or 0)
+    end)
+    for i, data in ipairs(playerData) do
+        if not data then break end
+        local eloNum = tonumber(data.Elo) or 0
+        local entry = Instance.new("TextLabel")
+        entry.Size = UDim2.new(1, -4, 0, 22)
+        entry.BackgroundTransparency = 1
+        entry.Font = Enum.Font.Gotham
+        entry.TextSize = 12
+        entry.TextXAlignment = Enum.TextXAlignment.Left
+        if data.Player == LocalPlayer then
+            entry.TextColor3 = Color3.fromRGB(255, 215, 0)
+            entry.Text = string.format("%d. %s  [YOU]", i, data.Name or "Unknown")
+        else
+            entry.TextColor3 = GetRankColor(eloNum)
+            entry.Text = string.format("%d. %s", i, data.Name or "Unknown")
+        end
+        entry.Parent = ListFrame
+
+        local statsEntry = Instance.new("TextLabel")
+        statsEntry.Size = UDim2.new(0, 280, 0, 22)
+        statsEntry.Position = UDim2.new(1, -284, 0, 0)
+        statsEntry.BackgroundTransparency = 1
+        statsEntry.Font = Enum.Font.Gotham
+        statsEntry.TextSize = 11
+        statsEntry.TextColor3 = Color3.fromRGB(160, 160, 190)
+        statsEntry.TextXAlignment = Enum.TextXAlignment.Right
+        statsEntry.Text = string.format("Levels: %s  |  %s (%s)  |  Winstreak: %s", data.Level or "?", GetRankName(eloNum), data.Elo or "?", data.Winstreak or "?")
+        statsEntry.Parent = entry
+    end
+    ListFrame.CanvasSize = UDim2.new(0, 0, 0, #playerData * 24 + 10)
+    if #playerData > 0 then PrintToConsole(playerData) end
+    CheckForHighStats(playerData)
+end
+
+UpdateStatusDot()
+RefreshLeaderboard()
+
+task.spawn(function()
+    while task.wait(SETTINGS.CHECK_INTERVAL) do
+        if not selfDestructed then pcall(RefreshLeaderboard) end
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.L then
+        print("[BINDS] 'L' Pressed: Leaving duel...")
+        local duelsRemote = game:GetService("ReplicatedStorage"):WaitForChild("Remotes", 3):WaitForChild("Duels", 3):WaitForChild("LeaveDuel", 3)
+        if duelsRemote then 
+            duelsRemote:FireServer() 
+        end
+
+    elseif input.KeyCode == Enum.KeyCode.G then
+        print("[BINDS] 'G' Pressed: Joining arcade...")
+        triggerArcadeJoin()
+
+    elseif input.KeyCode == Enum.KeyCode.W then
+        getgenv().WhitelistConfig.Enabled = not getgenv().WhitelistConfig.Enabled
+        print("[BINDS] 'W' Pressed: Whitelist status is now -> " .. tostring(getgenv().WhitelistConfig.Enabled))
+        if getgenv().WhitelistConfig.Enabled then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and not isWhitelisted(player.Name) then 
+                    forceDisconnect() 
+                    break 
+                end
+            end
+        end
+
+    elseif input.KeyCode == Enum.KeyCode.R then
+        print("[BINDS] 'R' Pressed: Re-scanning and concealing map parts...")
+        hideMapKeepPlayers()
+
+    elseif input.KeyCode == Enum.KeyCode.T then
+        SETTINGS.PROTECTION_ENABLED = not SETTINGS.PROTECTION_ENABLED
+        UpdateStatusDot()
+        print("[BINDS] 'T' Pressed: Target Stats Auto-Leave Protection is now -> " .. (SETTINGS.PROTECTION_ENABLED and "ENABLED" or "DISABLED"))
+
+    elseif input.KeyCode == Enum.KeyCode.Y then
+        print("[BINDS] 'Y' Pressed: Rejoining server instance...")
+        rejoin()
+
+    elseif input.KeyCode == Enum.KeyCode.F2 and not selfDestructed then
+        selfDestructed = true
+        print("[BINDS] 'F2' Pressed: Self-destruct initiated...")
+        RivalsLeaderboard:Destroy()
+        for _, v in ipairs(getgc and getgc() or {}) do
+            if type(v) == "function" and getfenv and pcall(getfenv, v) then
+                local env = getfenv(v)
+                if env and env == fenv then 
+                    pcall(function() setfenv(v, {}) end) 
+                end
+            end
+        end
+        print("[RIVALS] GUI destroyed. Script disabled.")
+
+    elseif input.KeyCode == Enum.KeyCode.F4 then
+        leaderboardVisible = not leaderboardVisible
+        RivalsLeaderboard.Enabled = leaderboardVisible
+        print("[BINDS] 'F4' Pressed: Leaderboard visibility toggled -> " .. tostring(leaderboardVisible))
+    end
+end)
+
+getgenv().Enable = function() getgenv().WhitelistConfig.Enabled = true end
+getgenv().Disable = function() getgenv().WhitelistConfig.Enabled = false end
+getgenv().Toggle = function() getgenv().WhitelistConfig.Enabled = not getgenv().WhitelistConfig.Enabled end
+getgenv().AddToWhitelist = function(name)
+    if #getgenv().WhitelistConfig.WHITELIST >= 17 then return end
+    if not isWhitelisted(name) then table.insert(getgenv().WhitelistConfig.WHITELIST, name) end
+end
+getgenv().RemoveFromWhitelist = function(name)
+    for i, allowedName in ipairs(getgenv().WhitelistConfig.WHITELIST) do
+        if allowedName == name then table.remove(getgenv().WhitelistConfig.WHITELIST, i) return end
+    end
+end
+getgenv().PrintWhitelist = function()
+    for _, name in ipairs(getgenv().WhitelistConfig.WHITELIST) do print(name) end
+end
+
+-- ====================================================================================
+-- TIMER TRACKING & AUTOMATIC MATCH REJOINER
+-- ====================================================================================
+
+local isRejoining = false
+
+local function rejoinMatch()
+    if isRejoining then return end
+    isRejoining = true
+
+    print("match ended (" .. START_TRACKING_AT .. "). rejoining game.")
+
+    local success, errorMessage = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end)
+
+    if not success then
+        warn("rejoin failed: " .. tostring(errorMessage))
+        isRejoining = false
+    end
+end
+
+local function getObjectText(obj)
+    local success, val = pcall(function() return obj.Value end)
+    if success and val ~= nil then
+        return tostring(val)
+    elseif obj:IsA("TextLabel") or obj:IsA("TextBox") then
+        return obj.Text
+    end
+    return nil
+end
+
+local function checkObject(obj)
+    local text = getObjectText(obj)
+    if text and string.gsub(text, "%s+", "") == START_TRACKING_AT then
+        rejoinMatch()
+    end
+end
+
+local function observeObject(obj)
+    local changeSignal = obj:IsA("ValueBase") and obj.Changed or (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj:GetPropertyChangedSignal("Text")
+
+    if changeSignal then
+        changeSignal:Connect(function()
+            checkObject(obj)
+        end)
+    end
+
+    checkObject(obj)
+end
+
+print("rejoiner active (" .. START_TRACKING_AT .. ")")
+
+PlayerGui.DescendantAdded:Connect(function(descendant)
+    observeObject(descendant)
+end)
+
+task.spawn(function()
+    local allDescendants = PlayerGui:GetDescendants()
+    for i, descendant in ipairs(allDescendants) do
+        observeObject(descendant)
+        if i % 150 == 0 then task.wait() end
+    end
+end)
